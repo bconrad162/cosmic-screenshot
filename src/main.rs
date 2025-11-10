@@ -80,6 +80,16 @@ async fn main() {
     crate::localize::localize();
 
     let args = Args::parse();
+    if args.annotate {
+        if let Err(err) = terminate_existing_annotators(&args.annotate_tool) {
+            eprintln!("{err}");
+        }
+    }
+    let previous_clipboard = if args.annotate {
+        snapshot_clipboard_png()
+    } else {
+        None
+    };
     let picture_dir = (!args.interactive).then(|| {
         args.save_dir
             .filter(|dir| dir.is_dir())
@@ -126,7 +136,12 @@ async fn main() {
                 (ScreenshotSource::File(response_path), display_path)
             }
         }
-        "clipboard" => (ScreenshotSource::Clipboard, String::new()),
+        "clipboard" => (
+            ScreenshotSource::Clipboard {
+                previous: previous_clipboard,
+            },
+            String::new(),
+        ),
         scheme => panic!("unsupported scheme '{}'", scheme),
     };
 
@@ -204,7 +219,7 @@ fn annotate_with_tool(command: &str, path: &Path) -> Result<(), String> {
 #[derive(Debug)]
 enum ScreenshotSource {
     File(PathBuf),
-    Clipboard,
+    Clipboard { previous: Option<Vec<u8>> },
 }
 
 struct AnnotationInput {
@@ -220,23 +235,25 @@ fn prepare_annotation_input(source: &ScreenshotSource) -> Option<AnnotationInput
             cleanup_after_use: false,
             reclip_after_edit: false,
         }),
-        ScreenshotSource::Clipboard => match persist_clipboard_png() {
-            Ok(temp_path) => Some(AnnotationInput {
-                path: temp_path,
-                cleanup_after_use: true,
-                reclip_after_edit: true,
-            }),
-            Err(err) => {
-                eprintln!("{err}");
-                None
+        ScreenshotSource::Clipboard { previous } => {
+            match persist_clipboard_png(previous.as_deref()) {
+                Ok(temp_path) => Some(AnnotationInput {
+                    path: temp_path,
+                    cleanup_after_use: true,
+                    reclip_after_edit: true,
+                }),
+                Err(err) => {
+                    eprintln!("{err}");
+                    None
+                }
             }
-        },
+        }
     }
 }
 
-fn persist_clipboard_png() -> Result<PathBuf, String> {
-    let png =
-        grab_clipboard_png().map_err(|err| format!("Failed to read clipboard image: {err}"))?;
+fn persist_clipboard_png(previous: Option<&[u8]>) -> Result<PathBuf, String> {
+    let png = grab_clipboard_png(previous)
+        .map_err(|err| format!("Failed to read clipboard image: {err}"))?;
 
     let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S%3f");
     let temp_path = env::temp_dir().join(format!("cosmic-screenshot-clipboard-{timestamp}.png"));
@@ -246,7 +263,40 @@ fn persist_clipboard_png() -> Result<PathBuf, String> {
     Ok(temp_path)
 }
 
-fn grab_clipboard_png() -> Result<Vec<u8>, String> {
+fn grab_clipboard_png(previous: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    const ATTEMPTS: usize = 25;
+    const WAIT_MS: u64 = 80;
+    let mut last_err = String::new();
+    let mut identical_reads = 0;
+
+    for attempt in 0..ATTEMPTS {
+        match read_clipboard_png_once() {
+            Ok(bytes) => {
+                if previous.map(|p| p == bytes.as_slice()).unwrap_or(false)
+                    && attempt + 1 < ATTEMPTS
+                    && identical_reads < 5
+                {
+                    identical_reads += 1;
+                    thread::sleep(Duration::from_millis(WAIT_MS));
+                    continue;
+                }
+
+                return Ok(bytes);
+            }
+            Err(err) => {
+                last_err = err;
+            }
+        }
+
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(Duration::from_millis(WAIT_MS));
+        }
+    }
+
+    Err(last_err)
+}
+
+fn read_clipboard_png_once() -> Result<Vec<u8>, String> {
     let mut errors = Vec::new();
 
     match capture_command_stdout("wl-paste", &["--no-newline", "--type", "image/png"]) {
@@ -269,36 +319,27 @@ fn grab_clipboard_png() -> Result<Vec<u8>, String> {
 }
 
 fn capture_command_stdout(command: &str, args: &[&str]) -> Result<Vec<u8>, String> {
-    const ATTEMPTS: usize = 5;
-    let mut last_err = String::new();
+    let output = Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|err| format!("Failed to run '{command}': {err}"))?;
 
-    for attempt in 0..ATTEMPTS {
-        match Command::new(command).args(args).output() {
-            Ok(output) => {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let mut message = format!("'{command}' exited with status {}", output.status);
-                    if !stderr.is_empty() {
-                        message.push_str(&format!(" ({stderr})"));
-                    }
-                    last_err = message;
-                } else if output.stdout.is_empty() {
-                    last_err = format!("'{command}' produced no clipboard data on stdout");
-                } else {
-                    return Ok(output.stdout);
-                }
-            }
-            Err(err) => {
-                last_err = format!("Failed to run '{command}': {err}");
-            }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!("'{command}' exited with status {}", output.status));
         }
-
-        if attempt + 1 < ATTEMPTS {
-            thread::sleep(Duration::from_millis(75));
-        }
+        return Err(format!(
+            "'{command}' exited with status {} ({stderr})",
+            output.status
+        ));
     }
 
-    Err(last_err)
+    if output.stdout.is_empty() {
+        return Err(format!("'{command}' produced no clipboard data on stdout"));
+    }
+
+    Ok(output.stdout)
 }
 
 fn copy_png_to_clipboard(path: &Path) -> Result<(), String> {
@@ -347,4 +388,41 @@ fn pipe_into_command(command: &str, args: &[&str], data: &[u8]) -> Result<(), St
     } else {
         Err(format!("'{command}' exited with status {status}"))
     }
+}
+
+fn snapshot_clipboard_png() -> Option<Vec<u8>> {
+    read_clipboard_png_once().ok()
+}
+
+fn terminate_existing_annotators(command: &str) -> Result<(), String> {
+    let process_name = Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command);
+
+    if let Err(err) = attempt_process_kill("pkill", &["-x"], process_name) {
+        if let Err(second_err) = attempt_process_kill("killall", &["-q"], process_name) {
+            return Err(format!(
+                "Failed to terminate existing '{process_name}' instances: {err}; {second_err}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn attempt_process_kill(executable: &str, args: &[&str], process_name: &str) -> Result<(), String> {
+    let status = Command::new(executable)
+        .args(args)
+        .arg(process_name)
+        .status()
+        .map_err(|err| format!("Failed to run '{executable}': {err}"))?;
+
+    if status.success() || status.code() == Some(1) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "'{executable}' exited with status {status} while terminating '{process_name}'",
+    ))
 }
